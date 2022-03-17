@@ -10,6 +10,9 @@ from sklearn.metrics import f1_score
 import torch.nn as nn
 import numpy as np
 
+from torch.profiler import profile, record_function, ProfilerActivity
+from torch.profiler import schedule
+
 def evaluate(dataCenter, ds, graphSage, classification, device, max_vali_f1, name, cur_epoch):
     test_nodes = getattr(dataCenter, ds+'_test')
     val_nodes = getattr(dataCenter, ds+'_val')
@@ -141,53 +144,60 @@ def apply_model(dataCenter, ds, graphSage, classification, unsupervised_loss, b_
     batches = math.ceil(len(train_nodes) / b_sz)
 
     visited_nodes = set()
-    for index in range(batches):
-        nodes_batch = train_nodes[index*b_sz:(index+1)*b_sz]
 
-        # extend nodes batch for unspervised learning
-        # no conflicts with supervised learning
-        nodes_batch = np.asarray(list(unsupervised_loss.extend_nodes(nodes_batch, num_neg=num_neg)))
-        visited_nodes |= set(nodes_batch)
+    with profile(activities=[ProfilerActivity.CPU], record_shapes=False,
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3)) as prof:
+        with record_function("training"):
+            for index in range(batches):
+                nodes_batch = train_nodes[index*b_sz:(index+1)*b_sz]
 
-        # get ground-truth for the nodes batch
-        labels_batch = labels[nodes_batch]
+                # extend nodes batch for unspervised learning
+                # no conflicts with supervised learning
+                nodes_batch = np.asarray(list(unsupervised_loss.extend_nodes(nodes_batch, num_neg=num_neg)))
+                visited_nodes |= set(nodes_batch)
 
-        # feed nodes batch to the graphSAGE
-        # returning the nodes embeddings
-        embs_batch = graphSage(nodes_batch)
+                # get ground-truth for the nodes batch
+                labels_batch = labels[nodes_batch]
 
-        if learn_method == 'sup':
-            # superivsed learning
-            logists = classification(embs_batch)
-            loss_sup = -torch.sum(logists[range(logists.size(0)), labels_batch], 0)
-            loss_sup /= len(nodes_batch)
-            loss = loss_sup
-        elif learn_method == 'plus_unsup':
-            # superivsed learning
-            logists = classification(embs_batch)
-            loss_sup = -torch.sum(logists[range(logists.size(0)), labels_batch], 0)
-            loss_sup /= len(nodes_batch)
-            # unsuperivsed learning
-            if unsup_loss == 'margin':
-                loss_net = unsupervised_loss.get_loss_margin(embs_batch, nodes_batch)
-            elif unsup_loss == 'normal':
-                loss_net = unsupervised_loss.get_loss_sage(embs_batch, nodes_batch)
-            loss = loss_sup + loss_net
-        else:
-            if unsup_loss == 'margin':
-                loss_net = unsupervised_loss.get_loss_margin(embs_batch, nodes_batch)
-            elif unsup_loss == 'normal':
-                loss_net = unsupervised_loss.get_loss_sage(embs_batch, nodes_batch)
-            loss = loss_net
+                # feed nodes batch to the graphSAGE
+                # returning the nodes embeddings
+                embs_batch = graphSage(nodes_batch)
 
-        print('Step [{}/{}], Loss: {:.4f}, Dealed Nodes [{}/{}] '.format(index+1, batches, loss.item(), len(visited_nodes), len(train_nodes)))
-        loss.backward()
-        for model in models:
-            nn.utils.clip_grad_norm_(model.parameters(), 5)
-        optimizer.step()
+                if learn_method == 'sup':
+                    # superivsed learning
+                    logists = classification(embs_batch)
+                    loss_sup = -torch.sum(logists[range(logists.size(0)), labels_batch], 0)
+                    loss_sup /= len(nodes_batch)
+                    loss = loss_sup
+                elif learn_method == 'plus_unsup':
+                    # superivsed learning
+                    logists = classification(embs_batch)
+                    loss_sup = -torch.sum(logists[range(logists.size(0)), labels_batch], 0)
+                    loss_sup /= len(nodes_batch)
+                    # unsuperivsed learning
+                    if unsup_loss == 'margin':
+                        loss_net = unsupervised_loss.get_loss_margin(embs_batch, nodes_batch)
+                    elif unsup_loss == 'normal':
+                        loss_net = unsupervised_loss.get_loss_sage(embs_batch, nodes_batch)
+                    loss = loss_sup + loss_net
+                else:
+                    if unsup_loss == 'margin':
+                        loss_net = unsupervised_loss.get_loss_margin(embs_batch, nodes_batch)
+                    elif unsup_loss == 'normal':
+                        loss_net = unsupervised_loss.get_loss_sage(embs_batch, nodes_batch)
+                    loss = loss_net
 
-        optimizer.zero_grad()
-        for model in models:
-            model.zero_grad()
+                print('Step [{}/{}], Loss: {:.4f}, Dealed Nodes [{}/{}] '.format(index+1, batches, loss.item(), len(visited_nodes), len(train_nodes)))
+                loss.backward()
+                for model in models:
+                    nn.utils.clip_grad_norm_(model.parameters(), 5)
+                optimizer.step()
+
+                optimizer.zero_grad()
+                for model in models:
+                    model.zero_grad()
+                prof.step()
+
+    print(prof.key_averages().table(row_limit=15))
 
     return graphSage, classification
